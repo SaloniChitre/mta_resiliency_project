@@ -145,4 +145,3 @@ with col3:
 
 # --- FOOTER ---
 st.divider()
-st.markdown("<p style='text-align: center;'>View Live Code & Documentation: <b>github.com/salonichitre/mta-nexus</b></p>", unsafe_allow_html=True)
