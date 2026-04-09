@@ -1,61 +1,41 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-def run_cluster_monte_carlo(target_node, neighbor_nodes, intensity=4.0, mitigation=False, load_mult=1.0, iterations=500):
+def run_cluster_monte_carlo(hub_data, neighbors, intensity, mitigation, load_mult, iterations=1000):
     """
-    Simulates rainfall failure events with probabilistic neighbor cascading.
+    Generates unique failure probabilities for each node in the cluster.
     """
-    # Generate random storm scenarios using a Rayleigh distribution
-    simulated_rain = np.random.rayleigh(scale=intensity, size=iterations)
+    base_capacity = 8.0 
+    if mitigation:
+        base_capacity *= 1.5
     
-    results = []
+    # 1. Primary Hub Simulation (Gaussian distribution around selected intensity)
+    rain_samples = np.random.normal(intensity, 1.0, iterations)
+    # Ensure no negative rain
+    rain_samples = np.maximum(rain_samples, 0)
     
-    # Mitigation (Pumps) reduces the 'effective' rain volume
-    pump_efficiency = 0.65 if mitigation else 1.0
+    threshold = base_capacity / (1 + (load_mult - 1) * 0.3)
+    primary_failures = rain_samples > threshold
+    primary_prob = (np.sum(primary_failures) / iterations) * 100
     
-    for rain in simulated_rain:
-        # 1. PRIMARY NODE LOGIC
-        # Base health is 11.0 to provide a realistic buffer for NYC infrastructure
-        base_health = 11.0
-        structural_jitter = np.random.normal(0, 0.5)
+    # 2. Neighbor Simulation with Spatial Variance
+    neighbor_probs = {}
+    for _, neighbor in neighbors.iterrows():
+        # Each neighbor gets a unique intensity sample (spatial variance)
+        n_intensity = intensity * np.random.uniform(0.7, 1.3)
+        n_samples = np.random.normal(n_intensity, 1.2, iterations)
+        n_samples = np.maximum(n_samples, 0)
         
-        # Threshold drops as physical_risk_score and load_mult (event surge) increase
-        resilience_threshold = (base_health - (target_node['physical_risk_score'] * 6.0)) / load_mult
-        
-        effective_rain = rain * pump_efficiency
-        is_failed = effective_rain >= (resilience_threshold + structural_jitter)
-        
-        # 2. NEIGHBOR CASCADE LOGIC (Gradual Failure)
-        # Instead of 0 or 18, we calculate how many individual neighbors fail.
-        neighbor_fails = 0
-        if is_failed:
-            # How far beyond the threshold did the rain go?
-            excess_severity = effective_rain - resilience_threshold
-            
-            # Probability of a neighbor failing increases with rain intensity
-            # If rain is just over the limit, maybe 10% fail. If it's a flood, 90% fail.
-            fail_chance = min(0.95, (excess_severity / 5.0)) 
-            
-            for _ in range(len(neighbor_nodes)):
-                # Each neighbor gets its own random roll
-                if np.random.random() < fail_chance:
-                    neighbor_fails += 1
-        
-        results.append({
-            "rainfall": rain,
-            "failed": is_failed,
-            "neighbors_impacted": neighbor_fails
-        })
-    
-    df = pd.DataFrame(results)
-    
-    # Calculate global metrics for the dashboard KPIs
-    total_neighbors = max(len(neighbor_nodes), 1)
-    failure_prob = (df['failed'].sum() / iterations) * 100
-    cascade_risk = (df['neighbors_impacted'].sum() / (iterations * total_neighbors)) * 100
-    
+        # Threshold adjusted by the node's specific physical risk score
+        n_threshold = base_capacity * (1.0 - neighbor['physical_risk_score'])
+        n_failures = n_samples > n_threshold
+        neighbor_probs[neighbor['stop_name']] = (np.sum(n_failures) / iterations) * 100
+
     return {
-        "failure_prob": failure_prob,
-        "cascade_risk": cascade_risk,
-        "raw_data": df
+        "failure_prob": primary_prob,
+        "neighbor_probs": neighbor_probs, 
+        "raw_data": pd.DataFrame({
+            "Rain_Sample": rain_samples,
+            "Failed": primary_failures
+        })
     }
