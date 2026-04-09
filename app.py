@@ -20,7 +20,7 @@ def plot_asset_risk(intensity, load_mult):
         x=x, y=y, 
         mode='lines+markers', 
         line=dict(color='#ff4b4b', width=3),
-        marker=dict(size=8)
+        marker=dict(size=8, color='#ff4b4b')
     ))
     fig.update_layout(
         title="📈 Asset Risk vs. Rainfall Intensity",
@@ -28,8 +28,8 @@ def plot_asset_risk(intensity, load_mult):
         plot_bgcolor='rgba(0,0,0,0)',
         font=dict(color="white"), 
         height=350,
-        xaxis=dict(title="Intensity (mm/hr)", gridcolor="gray"),
-        yaxis=dict(title="Est. Damage ($)", gridcolor="gray")
+        xaxis=dict(title="Intensity (mm/hr)", gridcolor="rgba(255,255,255,0.1)"),
+        yaxis=dict(title="Est. Damage ($)", gridcolor="rgba(255,255,255,0.1)")
     )
     return fig
 
@@ -60,10 +60,30 @@ YEARLY_EVENTS = {
 }
 
 STRATEGY_MAP = {
-    "Times Sq-42 St": {"bypass": "Grand Central (S Shuttle)", "j_mz": "Divert M to 6th Ave via Christie St.", "g_line": "Standby for LIC-Queens connection.", "bus": True},
-    "34 St-Penn Station": {"bypass": "34 St-Herald Sq (B/D/F/M/N/Q/R/W)", "j_mz": "Increase J/Z headways to 8m.", "g_line": "No impact; maintain standard ops.", "bus": True},
-    "14 St-Union Sq": {"bypass": "14 St-6 Av (F/M/L)", "j_mz": "Terminate J at Chambers St.", "g_line": "Deploy 8-car sets for Brooklyn bypass.", "bus": True},
-    "Fulton St": {"bypass": "WTC Cortlandt (1)", "j_mz": "Terminate J at Broad St.", "g_line": "Extend G to Church Av for surge relief.", "bus": False}
+    "Times Sq-42 St": {
+        "bypass": "Grand Central (S Shuttle)", 
+        "j_mz": "Divert M to 6th Ave via Christie St. Skip 14 St.", 
+        "g_line": "Standby for LIC-Queens connection; increase G-S shuttle frequency.", 
+        "bus": True
+    },
+    "34 St-Penn Station": {
+        "bypass": "34 St-Herald Sq (B/D/F/M/N/Q/R/W)", 
+        "j_mz": "J/Z: Increase headways to 8m. M: Terminate at Essex St.", 
+        "g_line": "No impact; maintain standard G-line headways.", 
+        "bus": True
+    },
+    "14 St-Union Sq": {
+        "bypass": "14 St-6 Av (F/M/L)", 
+        "j_mz": "Terminate J at Chambers St. Divert M to Broadway Local.", 
+        "g_line": "Deploy 8-car sets for Brooklyn bypass support.", 
+        "bus": True
+    },
+    "Fulton St": {
+        "bypass": "WTC Cortlandt (1)", 
+        "j_mz": "J/Z: Terminate at Broad St. No M service south of Delancey.", 
+        "g_line": "Extend G to Church Av for surge relief.", 
+        "bus": False
+    }
 }
 
 hubs = load_hubs()
@@ -87,45 +107,70 @@ with st.sidebar:
             event_choice = st.selectbox("Trigger Event:", [e["name"] for e in month_events])
             active_event = next(e for e in month_events if e["name"] == event_choice)
     st.divider()
-    selected_hub = st.selectbox("Active Monitoring Hub:", hubs['stop_name'].sort_values())
+    
+    unique_stations = sorted(hubs['stop_name'].unique())
+    selected_hub = st.selectbox("Active Monitoring Hub:", unique_stations)
+    
     intensity = st.slider("Rainfall Intensity (mm/hr)", 1.0, 10.0, 4.0, step=0.5)
     st.subheader("🛡️ Mitigation Response")
     deploy_mitigation = st.checkbox("Deploy Emergency Pumps & Gates", value=False)
+    
     if st.button("🚀 Force Simulation Refresh"):
         st.session_state.current_seed = random.randint(1, 99999)
+        st.cache_data.clear()
 
 # --- 4. DYNAMIC SIMULATION ENGINE ---
-is_critical = intensity >= 4.0
+
+# UPDATE: Load multiplier is calculated first so the simulation can use it
+current_load_mult = 1.0
+node_status = "STABLE"
+if enable_event:
+    event_hub_keyword = active_event.get('hub', 'N/A')
+    if event_hub_keyword.lower() in selected_hub.lower():
+        current_load_mult = active_event['mult']
+        node_status = "PRIMARY EVENT HUB"
+
 main_hub_data = hubs[hubs['stop_name'] == selected_hub].iloc[0]
 hubs['dist_to_selected'] = np.sqrt((hubs['stop_lat'] - main_hub_data['stop_lat'])**2 + (hubs['stop_lon'] - main_hub_data['stop_lon'])**2)
 adjacent_neighbors = hubs[(hubs['dist_to_selected'] <= 0.012) & (hubs['stop_name'] != selected_hub)]
-mc_results = run_cluster_monte_carlo(main_hub_data, adjacent_neighbors)
+
+@st.cache_data
+def get_stable_simulation(stop_name, intensity_val, mitigation_active, load_val, seed):
+    np.random.seed(seed)
+    # Simulation now accepts the event load multiplier as a factor
+    return run_cluster_monte_carlo(main_hub_data, adjacent_neighbors, intensity=intensity_val, mitigation=mitigation_active, load_mult=load_val)
+
+mc_results = get_stable_simulation(selected_hub, intensity, deploy_mitigation, current_load_mult, st.session_state.current_seed)
+
+failure_prob = mc_results['failure_prob']
+is_critical = failure_prob > 30.0 
+
 mitigation_boost = 0.4 if deploy_mitigation else 0.0
-cascade_radius = 0.025 * (1.0 - (mitigation_boost * 0.5)) 
+# Radius is now truly dynamic based on simulation failure probability
+cascade_radius = (failure_prob / 100) * 0.045 * (1.0 - (mitigation_boost * 0.5)) 
 
-hub_strategy = STRATEGY_MAP.get(selected_hub, {"bypass": "Nearest Safe Node", "j_mz": "Reduce headways to 6m system-wide.", "g_line": "Standard 4-car operations.", "bus": False})
+hub_strategy = STRATEGY_MAP.get(selected_hub, {
+    "bypass": "Nearest Safe Node", 
+    "j_mz": "Standard system-wide headways.", 
+    "g_line": "Standard 4-car local operations.", 
+    "bus": False
+})
 
-load_mult = 1.0
-node_status = "STABLE"
 affected_neighbors_df = pd.DataFrame()
-
 if enable_event:
     event_hub_keyword = active_event.get('hub', 'N/A')
     event_hub_matches = hubs[hubs['stop_name'].str.contains(event_hub_keyword, case=False, na=False)]
     if not event_hub_matches.empty:
         e_lat, e_lon = event_hub_matches.iloc[0]['stop_lat'], event_hub_matches.iloc[0]['stop_lon']
         hubs['dist_to_event'] = np.sqrt((hubs['stop_lat'] - e_lat)**2 + (hubs['stop_lon'] - e_lon)**2)
-        if event_hub_keyword.lower() in selected_hub.lower():
-            load_mult = active_event['mult']
-            node_status = "PRIMARY EVENT HUB"
-        elif hubs.loc[hubs['stop_name'] == selected_hub, 'dist_to_event'].values[0] < 0.015:
-            load_mult = 1.0 + (active_event['mult'] - 1.0) * 0.4
+        if node_status != "PRIMARY EVENT HUB" and hubs.loc[hubs['stop_name'] == selected_hub, 'dist_to_event'].values[0] < 0.015:
             node_status = "AFFECTED NEIGHBOR"
         affected_neighbors_df = hubs[(hubs['dist_to_event'] < 0.015) & (hubs['stop_name'] != selected_hub)]
 
 if is_critical:
     all_affected_nodes = hubs[(hubs['dist_to_selected'] <= cascade_radius) & (hubs['stop_name'] != selected_hub)]
-    total_impacted = int((main_hub_data['daily_ridership'] * load_mult) + all_affected_nodes['daily_ridership'].sum())
+    total_impacted = int((main_hub_data['daily_ridership'] * current_load_mult) + all_affected_nodes['daily_ridership'].sum())
+    
     if hub_strategy["bypass"] == "Nearest Safe Node":
         alt_candidates = hubs[hubs['dist_to_selected'] > cascade_radius]
         alt_path = alt_candidates.nsmallest(1, 'dist_to_selected').iloc[0]['stop_name'] if not alt_candidates.empty else "N/A"
@@ -133,17 +178,17 @@ if is_critical:
         alt_path = hub_strategy["bypass"]
 else:
     all_affected_nodes = pd.DataFrame()
-    total_impacted = int(main_hub_data['daily_ridership'] * load_mult)
+    total_impacted = int(main_hub_data['daily_ridership'] * current_load_mult)
     alt_path = "N/A"
 
 # --- 5. DASHBOARD HEADER & KPIS ---
 st.title("🚇 MTA NEXUS: EMERGENCY OPERATIONS CENTER")
-display_context = active_event['name'] if load_mult > 1.0 else "Standard Operations"
+display_context = active_event['name'] if current_load_mult > 1.0 else "Standard Operations"
 st.markdown(f"**Scenario:** {sim_month} 2026 | **Node Status:** {node_status} | **Context:** {display_context}")
 
 k1, k2, k3, k4 = st.columns(4)
-k1.metric("Commuters Impacted", f"{total_impacted:,}", delta=f"+{int((load_mult-1)*100)}% Surge" if load_mult > 1 else None, delta_color="inverse")
-k2.metric("Failure Probability", f"{mc_results['failure_prob']:.1f}%", delta="Risk High" if mc_results['failure_prob'] > 40 else "Nominal", delta_color="inverse")
+k1.metric("Commuters Impacted", f"{total_impacted:,}", delta=f"+{int((current_load_mult-1)*100)}% Surge" if current_load_mult > 1 else None, delta_color="inverse")
+k2.metric("Failure Probability", f"{failure_prob:.1f}%", delta=f"{intensity} mm/hr Load", delta_color="inverse")
 k3.metric("Bypass Target", alt_path if is_critical else "Optimal", border=True)
 eti = "STABILIZED" if deploy_mitigation and is_critical else f"{int(max(60 - (intensity * 5.8), 3))} min"
 k4.metric("Est. Time to Inundation", eti if is_critical else "N/A")
@@ -160,9 +205,7 @@ with col_map:
     if is_critical:
         folium.Circle([main_hub_data['stop_lat'], main_hub_data['stop_lon']], radius=cascade_radius * 100000, color='red', fill=True, fill_opacity=0.1).add_to(m)
         for _, node in all_affected_nodes.iterrows():
-            # RESTORED: Connecting Lines
             folium.PolyLine(locations=[[main_hub_data['stop_lat'], main_hub_data['stop_lon']], [node['stop_lat'], node['stop_lon']]], color="#e67e22", weight=1.5, opacity=0.6).add_to(m)
-            # RESTORED: Rich Tooltips
             folium.CircleMarker([node['stop_lat'], node['stop_lon']], radius=8, color="#e67e22", fill=True, fill_opacity=0.7,
                 tooltip=folium.Tooltip(f"<b>NODE:</b> {node['stop_name']}<br><b>STATUS:</b> Cascade Risk<br><b>LOAD:</b> {int(node['daily_ridership']):,}")).add_to(m)
 
@@ -170,17 +213,16 @@ with col_map:
         for _, neighbor in affected_neighbors_df.iterrows():
             folium.PolyLine(locations=[[main_hub_data['stop_lat'], main_hub_data['stop_lon']], [neighbor['stop_lat'], neighbor['stop_lon']]], color="#3498db", weight=1, opacity=0.4, dash_array='5, 5').add_to(m)
             folium.CircleMarker([neighbor['stop_lat'], neighbor['stop_lon']], radius=6, color="#3498db", fill=True, fill_opacity=0.6,
-                tooltip=folium.Tooltip(f"<b>SURGE:</b> {neighbor['stop_name']}<br><b>MULT:</b> {load_mult:.2f}x")).add_to(m)
+                tooltip=folium.Tooltip(f"<b>SURGE:</b> {neighbor['stop_name']}<br><b>MULT:</b> {current_load_mult:.2f}x")).add_to(m)
 
     folium.Marker([main_hub_data['stop_lat'], main_hub_data['stop_lon']], icon=folium.Icon(color='red' if is_critical else 'blue', icon='warning', prefix='fa'), tooltip=folium.Tooltip(f"<b>PRIMARY HUB:</b> {selected_hub}")).add_to(m)
-    st_folium(m, width=850, height=500)
+    st_folium(m, width=850, height=500, key="mta_nexus_map")
 
 with col_action:
     st.subheader("🛠️ EOC Strategic Action Plan")
     if is_critical:
-        if intensity > 7.5: st.error("🚨 LEVEL 1: FULL SYSTEM ISOLATION")
-        else: st.warning("⚠️ LEVEL 2: SECTOR CONTAINMENT")
-        st.markdown("### 🚇 Subway Rerouting")
+        st.error(f"🚨 SECTOR THREAT: {failure_prob:.0f}% PROBABILITY")
+        st.markdown(f"### 🚇 Subway Rerouting: {selected_hub}")
         st.write(f"**Primary Bypass:** {alt_path}")
         re_cols = st.columns(2)
         re_cols[0].info(f"**J/M/Z Lines**\n\n{hub_strategy['j_mz']}")
@@ -191,28 +233,27 @@ with col_action:
         st.markdown("### 🔧 Engineering Checklist")
         st.checkbox("Seal East River Flood Gates", value=is_critical)
         st.checkbox("Deploy Pump Train to Sector", value=intensity > 6.5)
-        st.error(f"Projected Asset Risk: **${(intensity * 220000 * load_mult):,.0f}**")
+        st.error(f"Projected Asset Risk: **${(intensity * 220000 * current_load_mult):,.0f}**")
     else:
         st.success("✅ **SYSTEM NOMINAL**")
 
-# --- 7. ANALYTICS: RADAR, RISK CURVE, & LOGS ---
+# --- 7. ANALYTICS ---
 st.divider()
 c1, c2, c3 = st.columns([1, 1, 1])
 
 with c1:
     st.subheader("🕸️ Hub Stress Radar Chart")
     i_risk = min(100, (main_hub_data['physical_risk_score'] * intensity * 10))
-    r_load = min(100, (load_mult * 20))
+    r_load = min(100, (current_load_mult * 20))
     age_stress, iso_stress = (80 if "St" in selected_hub else 45), (min(100, (len(all_affected_nodes) * 15)) if is_critical else 10)
     pwr_stress = 90 if deploy_mitigation and intensity > 6 else 35
     fig_radar = go.Figure()
-    fig_radar.add_trace(go.Scatterpolar(r=[i_risk, r_load, age_stress, iso_stress, pwr_stress], theta=['Inundation Risk', 'Ridership Load', 'Infrastructure Age', 'Network Isolation', 'Power Grid Stress'], fill='toself', line_color='#00FFCC', fillcolor='rgba(0, 255, 204, 0.3)'))
+    fig_radar.add_trace(go.Scatterpolar(r=[failure_prob, r_load, age_stress, iso_stress, pwr_stress], theta=['Inundation Risk', 'Ridership Load', 'Infrastructure Age', 'Network Isolation', 'Power Grid Stress'], fill='toself', line_color='#00FFCC', fillcolor='rgba(0, 255, 204, 0.3)'))
     fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100], gridcolor="gray"), bgcolor="rgba(0,0,0,0)"), template="plotly_dark", height=380, margin=dict(l=40, r=40, t=20, b=20))
     st.plotly_chart(fig_radar, use_container_width=True)
 
 with c2:
-    # RESTORED: Risk Curve
-    fig_risk = plot_asset_risk(intensity, load_mult)
+    fig_risk = plot_asset_risk(intensity, current_load_mult)
     st.plotly_chart(fig_risk, use_container_width=True)
 
 with c3:
